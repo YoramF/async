@@ -1,14 +1,14 @@
 libasync: async.o
 	ar rcs libasync.a async.o
 
-async.o: async.c
-	gcc -c async.c -o async.o
+async.o: async.c async.h
+	gcc -c async.c -o async.o -I.
 
 libasync_d: async_d.o
 	ar rcs libasync_d.a async_d.o
 
-async_d.o: async.c
-	gcc -g -c async.c -o async_d.o -DLOG
+async_d.o: async.c async.h
+	gcc -g -c async.c -o async_d.o -DLOG -I.
 
 tst_d: tst.c libasync_d.a async.h
 	gcc -g tst.c -o tst_d -lasync_d -L. -I.

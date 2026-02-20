@@ -11,12 +11,13 @@
  */
 
 #include <pthread.h>
-#include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+
+#include <async.h>
 
 // Structure to hold the result and identity of a completed thread
 typedef struct {
@@ -33,6 +34,7 @@ typedef struct {
     m_thread_result_t   *queue;
 } m_result_mailbox_t;
 
+// worker argument
 typedef struct {
     void    (*func)(void *arg, void *res);
     void    (*callback)(void *arg, void *res);
@@ -49,13 +51,65 @@ static m_result_mailbox_t s_mailbox = {
     .count = 0
 };
 
+// variable lenngh structure to track all "async_sync_func_init" calls
+// so that we can free all allocated RAM once async_terminate() is called
+typedef struct {
+    int count;
+    async_s_func_t **s_funcs;
+} m_s_func_t;
+
 static int s_max_threads;
 static bool s_exit;
 static int s_outstanding_requests;
-static sem_t s_sync_sem;
 static pthread_mutex_t s_async_env_mutx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t s_async_env_cond = PTHREAD_COND_INITIALIZER;
+static m_s_func_t s_s_funcs = {
+    .count = 0,
+    .s_funcs = NULL
+};
 
+/**
+ * add new s_func to s_s_funcs store
+ */
+void s_s_funcs_add (async_s_func_t *p_s_func) {
+    int count = s_s_funcs.count;
+
+    if (count == 0) {
+        if ((s_s_funcs.s_funcs = malloc(sizeof(async_s_func_t *))) == NULL) {
+            perror("[s_s_funcs_add] Failed to allocate RAM\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+    else {
+        if ((s_s_funcs.s_funcs = realloc(s_s_funcs.s_funcs, (size_t)(count+1)*sizeof(async_s_func_t *))) == NULL) {
+            perror("[s_s_funcs_add] Failed to reallocate RAM\n");
+            exit(EXIT_FAILURE);           
+        }
+    }
+
+    s_s_funcs.s_funcs[count] = p_s_func;
+    s_s_funcs.count++;
+}
+
+/**
+ * Release all saved s_func structures
+ */
+void s_s_funcs_release () {
+    int i;
+
+    // first destroy all allocated mutexes
+    for (i = 0; i < s_s_funcs.count; i++)
+        pthread_mutex_destroy(&s_s_funcs.s_funcs[i]->lock);
+
+    free(s_s_funcs.s_funcs);    // s_s_funcs.funcs is either a valid poiuner or NULL
+    s_s_funcs.count = 0;
+    s_s_funcs.s_funcs = NULL;   // to make sure next calling to s_s_funcs_release () will not fail on free(invalid pointer)
+}
+
+
+/**
+ * Main worker thread
+ */
 static void *s_worker(void* arg) {
     m_worker_arg_t my_wrk = *(m_worker_arg_t *)arg;
 
@@ -218,7 +272,6 @@ int async_init (const int max_threads) {
     s_max_threads = max_threads;
     s_outstanding_requests = 0;
     s_exit = false;
-    sem_init(&s_sync_sem, 0, 1);    // default s_main_result_trd can use s_sync()
     pthread_t main_result;
 
     if ((s_mailbox.queue = malloc(max_threads * sizeof(m_thread_result_t))) == NULL) {
@@ -269,6 +322,9 @@ int async_terminate () {
 
     pthread_mutex_unlock(&s_async_env_mutx);
 
+    // delete all synchronous functions that were initialzed
+    s_s_funcs_release();
+
     #ifdef LOG
     printf("[async_terminate] Completed\n");
     #endif
@@ -308,4 +364,53 @@ int async_sync () {
         fprintf(stderr, "[async_sync] Called while async sytate is not active\n");
         return -1;
     }
+}
+
+/**
+ * In an asynchrounous state, we need to allow shared resorces to be updated in a synchrounous way.
+ * async_sync_func_init() allows us to declare a a function so that when other functions call it
+ * the rfunction will run in a locked safe state.
+ * It returns a pointer to async_s_func_t
+ */
+async_s_func_t *async_sync_func_init (void (*s_func)(void *arg, void *res)) {
+    async_s_func_t *p_async_s_func;
+
+    if ((p_async_s_func = malloc(sizeof(*p_async_s_func))) == NULL) {
+        perror("[async_sync_func_init] Failed to allocate RAM\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // init function lock
+    if (pthread_mutex_init(&(p_async_s_func->lock), 0) < 0) {
+        perror("[async_sync_func_init] Failed to allocate lock\n");
+        exit(EXIT_FAILURE);
+    }
+
+    p_async_s_func->s_func = s_func;
+
+    // stor s_func stracture for later relese
+    s_s_funcs_add(p_async_s_func);
+
+    return p_async_s_func;
+}
+
+/**
+ * Call s_func().
+ * Return 0 if all ok or -1 if called with false arguments
+ */
+int async_call (async_s_func_t *p_func, void *arg, void *res) {
+    
+    if (p_func == NULL)
+        return -1;
+
+    // lock
+    pthread_mutex_lock(&(p_func->lock));
+
+    // call the function
+    p_func->s_func(arg, res);
+
+    // release the lock
+    pthread_mutex_unlock(&(p_func->lock));
+
+    return 0;
 }
