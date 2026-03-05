@@ -43,13 +43,6 @@ typedef struct {
     void    *callback_res;
 } m_worker_arg_t;
 
-// workers args entries
-typedef struct m_worker_arg_entry_ {
-    struct m_worker_arg_entry_ *next_free;
-    struct m_worker_arg_entry_ *prev_free;
-    m_worker_arg_t arg;
-} m_worker_arg_entry_t;
-
 
 // module static variables
 static m_result_mailbox_t s_mailbox = {
@@ -65,11 +58,6 @@ typedef struct {
     async_s_func_t **s_funcs;
 } m_s_func_t;
 
-#define arg_entry_add(arg) ((m_worker_arg_entry_t *)(((void *)(arg))-2*sizeof(m_worker_arg_t *)))
-#define arg_add(arg_entry) ((m_worker_arg_t *)&((arg_entry)->arg))
-
-static m_worker_arg_entry_t *s_p_workers_args;
-static m_worker_arg_entry_t *s_p_free;
 static int s_max_threads;
 static bool s_exit;
 static int s_outstanding_requests;
@@ -83,7 +71,7 @@ static m_s_func_t s_s_funcs = {
 /**
  * add new s_func to s_s_funcs store
  */
-static void s_s_funcs_add (async_s_func_t *p_s_func) {
+void s_s_funcs_add (async_s_func_t *p_s_func) {
     int count = s_s_funcs.count;
 
     if (count == 0) {
@@ -106,7 +94,7 @@ static void s_s_funcs_add (async_s_func_t *p_s_func) {
 /**
  * Release all saved s_func structures
  */
-static void s_s_funcs_release () {
+void s_s_funcs_release () {
     int i;
 
     // first destroy all allocated mutexes
@@ -118,61 +106,6 @@ static void s_s_funcs_release () {
     s_s_funcs.s_funcs = NULL;   // to make sure next calling to s_s_funcs_release () will not fail on free(invalid pointer)
 }
 
-/**
- * Init workers args stracture
- * It also update s_p_free
- */
-static m_worker_arg_entry_t *s_init_worke_args (const int max_threads) {
-    m_worker_arg_entry_t *p_workers_arg;
-
-    // allocate one more element for easy handling
-    if ((p_workers_arg = malloc((max_threads+1)*sizeof(*p_workers_arg))) == NULL) {
-        perror("[s_init_worke_args] Failed to allocate RAM");
-        exit(EXIT_FAILURE);        
-    }
-
-    // initialze the args entries
-    for (int i = 0; i < max_threads; i++) {
-        p_workers_arg[i].next_free = &(p_workers_arg[i+1]);
-        p_workers_arg[i+1].prev_free = &p_workers_arg[i];
-    }
-
-
-    p_workers_arg[max_threads].next_free = &p_workers_arg[0];
-    p_workers_arg[0].prev_free = &p_workers_arg[max_threads];   
-    s_p_free = p_workers_arg;
-
-    return p_workers_arg;
-}
-
-/**
- * Get next free arg entry
- * It also update s_p_free
- */
-static m_worker_arg_t *s_get_free_arg () {
-    m_worker_arg_entry_t *p_workers_arg;
-
-    p_workers_arg = s_p_free;
-    s_p_free->prev_free->next_free = s_p_free->next_free;
-    s_p_free->next_free->prev_free = s_p_free->prev_free;
-    s_p_free = s_p_free->next_free;
-
-    return arg_add(p_workers_arg);
-}
-
-/**
- * Return worker arg entry to free entries 
- */
-static void s_release_worker_arg (m_worker_arg_t *worker_arg) {
-    m_worker_arg_entry_t *p_worker_arg;
-
-    p_worker_arg = arg_entry_add(worker_arg);
-
-    p_worker_arg->next_free = s_p_free;
-    p_worker_arg->prev_free = s_p_free->prev_free;
-    s_p_free->prev_free->next_free = p_worker_arg;
-    s_p_free->prev_free = p_worker_arg;
-}
 
 /**
  * Main worker thread
@@ -180,7 +113,7 @@ static void s_release_worker_arg (m_worker_arg_t *worker_arg) {
 static void *s_worker(void* arg) {
     m_worker_arg_t my_wrk = *(m_worker_arg_t *)arg;
 
-    s_release_worker_arg(arg);
+    free(arg);
 
     #ifdef LOG
     printf("[worker] Thread was created\n");
@@ -282,7 +215,10 @@ int async_launch (void (*ex_func)(void *arg, void *res), void (*cb_func)(void *a
     pthread_t worker_trd;
     m_worker_arg_t *wrk_arg;
 
-    wrk_arg = s_get_free_arg();
+    if ((wrk_arg = malloc(sizeof(m_worker_arg_t))) == NULL) {
+        perror("[async_launch] Failed to allocate RAM");
+        exit(EXIT_FAILURE);
+    }
     wrk_arg->callback_res = cb_res;
     wrk_arg->func = ex_func;
     wrk_arg->func_arg = ex_arg;
@@ -343,8 +279,6 @@ int async_init (const int max_threads) {
         exit(EXIT_FAILURE);
     }
 
-    s_p_workers_args = s_init_worke_args(max_threads);
-
     // launch main_result_trd as detached thread
     if (pthread_create(&main_result, NULL, s_main_result_trd, NULL) < 0){
         perror("[async_inint] Failed to launch tread\n");
@@ -390,10 +324,6 @@ int async_terminate () {
 
     // delete all synchronous functions that were initialzed
     s_s_funcs_release();
-
-    //release allocated ram for worker_thread
-    free(s_p_workers_args);
-    free(s_mailbox.queue);
 
     #ifdef LOG
     printf("[async_terminate] Completed\n");
