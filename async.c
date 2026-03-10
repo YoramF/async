@@ -24,15 +24,15 @@ typedef struct {
     void    (*callback)(void *arg, void *res);
     void    *callback_arg;
     void    *callback_res;
-} m_thread_result_t;
+} thread_result_t;
 
 // Shared Coordinator Structure
 typedef struct {
     pthread_mutex_t     mutex;
     pthread_cond_t      cond;
     int                 count; // How many results are currently in the queue
-    m_thread_result_t   *queue;
-} m_result_mailbox_t;
+    thread_result_t   *queue;
+} result_mailbox_t;
 
 // worker argument
 typedef struct {
@@ -41,11 +41,19 @@ typedef struct {
     void    *func_arg;
     void    *func_res;
     void    *callback_res;
-} m_worker_arg_t;
+} worker_arg_t;
+
+// callback caller worker argument
+typedef struct callback_arg_s {
+    struct callback_arg_s *next;
+    void    (*callback)(void *arg, void *res);    
+    void    *callback_arg;
+    void    *callback_res;    
+} callback_arg_t;
 
 
 // module static variables
-static m_result_mailbox_t s_mailbox = {
+static result_mailbox_t s_mailbox = {
     .mutex = PTHREAD_MUTEX_INITIALIZER,
     .cond  = PTHREAD_COND_INITIALIZER,
     .count = 0
@@ -56,14 +64,23 @@ static m_result_mailbox_t s_mailbox = {
 typedef struct {
     int count;
     async_s_func_t **s_funcs;
-} m_s_func_t;
+} s_func_t;
 
 static int s_max_threads;
 static bool s_exit;
 static int s_outstanding_requests;
+static int s_outstanding_callbacks;
+static pthread_t s_main_thread;
+static pthread_t s_callback_trd;
+static callback_arg_t *s_callback_args_head = NULL;
+static callback_arg_t *s_callback_args_tail = NULL;
 static pthread_mutex_t s_async_env_mutx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t s_async_env_cond = PTHREAD_COND_INITIALIZER;
-static m_s_func_t s_s_funcs = {
+static pthread_mutex_t s_callback_mutx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_callback_cond = PTHREAD_COND_INITIALIZER;
+// static pthread_mutex_t s_callback_sync_mutx = PTHREAD_MUTEX_INITIALIZER;
+// static pthread_cond_t s_callback_sync_cond = PTHREAD_COND_INITIALIZER;
+static s_func_t s_s_funcs = {
     .count = 0,
     .s_funcs = NULL
 };
@@ -111,7 +128,7 @@ void s_s_funcs_release () {
  * Main worker thread
  */
 static void *s_worker(void* arg) {
-    m_worker_arg_t my_wrk = *(m_worker_arg_t *)arg;
+    worker_arg_t my_wrk = *(worker_arg_t *)arg;
 
     free(arg);
 
@@ -142,14 +159,79 @@ static void *s_worker(void* arg) {
 }
 
 /**
+ * Main callback execution thread
+ * This thread is waiting for callbacks to be execute
+ */
+static void *s_callback (void *arg) {
+    #ifdef LOG
+    printf("[s_callback_trd] started\n");
+    #endif
+
+    while (s_exit == false) {
+
+        pthread_mutex_lock(&s_callback_mutx);
+        // Wait specifically until callback args list has something in it
+        while (s_outstanding_callbacks == 0) {
+            #ifdef LOG
+            printf("[s_callback_trd] entering pthread_cond_wait() state\n");
+            #endif
+            pthread_cond_wait(&s_callback_cond, &s_callback_mutx);
+
+            // in case we were awaken by async_terminate() exit thread;
+            if (s_exit == true)
+                goto s_callback_trd_done;
+        }
+
+        // Process csllbacks
+        while (s_callback_args_head != NULL) {
+            callback_arg_t *c_arg = s_callback_args_head;
+
+            #ifdef LOG
+            printf("[s_callback_trd] about to call calback\n");
+            #endif
+            
+            c_arg->callback(c_arg->callback_arg, c_arg->callback_res);
+
+            // remove callback arg from list
+            s_callback_args_head = c_arg->next;
+            if (s_callback_args_head == NULL)
+                s_callback_args_tail = NULL;
+
+            free(c_arg);
+
+            s_outstanding_callbacks--;
+            // signal async_sync() and async_terminate() about callback termination
+            pthread_mutex_lock(&s_async_env_mutx);
+
+            #ifdef LOG
+            printf("[s_callback_trd] locked s_async_env_mutx\n");
+            #endif
+
+            // pthread_cond_broadcast(&s_async_env_cond);
+            pthread_cond_signal(&s_async_env_cond);
+            pthread_mutex_unlock(&s_async_env_mutx);
+        }
+
+s_callback_trd_done:
+        pthread_mutex_unlock(&s_callback_mutx);        
+    }
+
+    #ifdef LOG
+    printf("[s_callback_trd] ended\n");
+    #endif
+
+    return NULL;    
+}
+
+/**
  * This is the main result thread. It runs as long as the async envirinment is active and as long as there are outstanding
- * async requests active. Per thread working thread completion, it will call the callback function as defined in the worker
- * arguments.
+ * async requests active. Per thread working thread completion, it will add a callback workload for callback thread
+ * and signal it about new warkload to process
  */
 static void *s_main_result_trd (void *arg) {
-    int sem;
+
     #ifdef LOG
-    printf("[main_result] s_main_result_trd started\n");
+    printf("[s_main_result_trd] started\n");
     #endif
 
     while (s_exit == false) {
@@ -158,47 +240,72 @@ static void *s_main_result_trd (void *arg) {
         // Wait specifically until the mailbox has something in it
         while (s_mailbox.count == 0) {
             #ifdef LOG
-            printf("[main_result] entering pthread_cond_wait() state, outstanding: %d\n", s_outstanding_requests);
+            printf("[s_main_result_trd] entering pthread_cond_wait() state, outstanding: %d\n", s_outstanding_requests);
             #endif
             pthread_cond_wait(&s_mailbox.cond, &s_mailbox.mutex);
 
             // in case we were awaken by async_terminate() exit thread;
             if (s_exit == true)
-                goto done;
+                goto s_main_result_trd_done;
         }
 
         // Identification: Pull the result from the "mailbox"
         while (s_mailbox.count > 0) {
             s_mailbox.count--;
 
-            #ifdef LOG
-            printf("[main_result] about to call calback outstanding: %d\n", s_outstanding_requests);
-            #endif
-
-            pthread_mutex_lock(&s_async_env_mutx);
-
-            m_thread_result_t res = s_mailbox.queue[s_mailbox.count];
+            thread_result_t res = s_mailbox.queue[s_mailbox.count];
 
             // check that callback function was specified in async_launch()
-            if (res.callback != NULL) {               
-                res.callback(res.callback_arg, res.callback_res);   
+            if (res.callback != NULL) {
+                callback_arg_t *c_arg;
+
+                pthread_mutex_lock(&s_callback_mutx);
+                
+                if ((c_arg = malloc(sizeof(callback_arg_t))) == NULL) {
+                    perror("[s_main_result_trd] Failed to allocate RAM");
+                    exit(EXIT_FAILURE);                    
+                }
+
+                #ifdef LOG
+                printf("[s_main_result_trd] adding new callback arg to list: %d\n", s_outstanding_requests);
+                #endif
+
+                c_arg->callback = res.callback;
+                c_arg->callback_arg = res.callback_arg;
+                c_arg->callback_res = res.callback_res;
+                c_arg->next = NULL;
+                if (s_callback_args_tail == NULL) {
+                    s_callback_args_tail =  c_arg;
+                    s_callback_args_head = c_arg;
+                }
+                else {
+                    s_callback_args_tail->next = c_arg;
+                    s_callback_args_tail = c_arg;
+                }
+
+                // Wake up the callback_trd in case it was blockec
+                s_outstanding_callbacks++;
+                pthread_cond_signal(&s_callback_cond);
+                pthread_mutex_unlock(&s_callback_mutx);
             }
                  
             // Wake up the launcing function in case it was blockec
+            pthread_mutex_lock(&s_async_env_mutx);
             s_outstanding_requests--;
+            // pthread_cond_broadcast(&s_async_env_cond);
             pthread_cond_signal(&s_async_env_cond);
             pthread_mutex_unlock(&s_async_env_mutx);
 
             #ifdef LOG
-            printf("[main_result] before return. outstanding: %d\n", s_outstanding_requests);
+            printf("[s_main_result_trd] before return. outstanding: %d\n", s_outstanding_requests);
             #endif
         }
-done:
+s_main_result_trd_done:
         pthread_mutex_unlock(&s_mailbox.mutex);
     }
 
     #ifdef LOG
-    printf("[main_result] s_main_result_trd ended\n");
+    printf("[s_main_result_trd] ended\n");
     #endif
 
     return NULL;
@@ -213,9 +320,9 @@ int async_launch (void (*ex_func)(void *arg, void *res), void (*cb_func)(void *a
     void *ex_arg, void *ex_res, void *cb_res) {
 
     pthread_t worker_trd;
-    m_worker_arg_t *wrk_arg;
+    worker_arg_t *wrk_arg;
 
-    if ((wrk_arg = malloc(sizeof(m_worker_arg_t))) == NULL) {
+    if ((wrk_arg = malloc(sizeof(worker_arg_t))) == NULL) {
         perror("[async_launch] Failed to allocate RAM");
         exit(EXIT_FAILURE);
     }
@@ -271,20 +378,25 @@ int async_launch (void (*ex_func)(void *arg, void *res), void (*cb_func)(void *a
 int async_init (const int max_threads) {
     s_max_threads = max_threads;
     s_outstanding_requests = 0;
+    s_outstanding_callbacks = 0;
     s_exit = false;
-    pthread_t main_result;
 
-    if ((s_mailbox.queue = malloc(max_threads * sizeof(m_thread_result_t))) == NULL) {
+    if ((s_mailbox.queue = malloc(max_threads * sizeof(thread_result_t))) == NULL) {
         perror("[asunc-init] Failed to allocate RAM");
         exit(EXIT_FAILURE);
     }
 
     // launch main_result_trd as detached thread
-    if (pthread_create(&main_result, NULL, s_main_result_trd, NULL) < 0){
-        perror("[async_inint] Failed to launch tread\n");
+    if (pthread_create(&s_main_thread, NULL, s_main_result_trd, NULL) < 0){
+        perror("[async_inint] Failed to launch main tread\n");
         exit(EXIT_FAILURE);
     }
-    pthread_detach(main_result);
+
+    // launch callback_trd as detached thread
+    if (pthread_create(&s_callback_trd, NULL, s_callback, NULL) < 0){
+        perror("[async_inint] Failed to launch callback tread\n");
+        exit(EXIT_FAILURE);
+    }
 
     return 0;
 }
@@ -305,22 +417,38 @@ int async_terminate () {
 
     pthread_mutex_lock(&s_async_env_mutx);
 
-    // wait untill sall poutstanding requests are done
-    while (s_outstanding_requests > 0) {
+    #ifdef LOG
+    printf("[async_terminate] entering callback termination wait loop\n");
+    #endif
+
+    // wait untill all outstanding requests and callbacks are done
+    while (s_outstanding_requests > 0 || s_outstanding_callbacks > 0) {
 
         // wait until it is possible to create new thread
         #ifdef LOG
-        printf("[async_terminate] s_outstanding_requests = %d\n", s_outstanding_requests);
+        printf("[async_terminate] s_outstanding_requests = %d, s_outstanding_callbacks = %d\n", s_outstanding_requests, s_outstanding_callbacks);
         #endif
-        pthread_cond_wait(&s_async_env_cond, &s_async_env_mutx);
+        pthread_cond_wait(&s_async_env_cond, &s_async_env_mutx);   // now wait for all callbacks to complete &s_async_env_mutx);
     }
 
+    pthread_mutex_unlock(&s_async_env_mutx);  // allow s_main_result_trd to resume use of s_sync()
+
+    #ifdef LOG
+    printf("[async_terminate] signaling main_tread and callback_thread to exit\n");
+    #endif
+
+    pthread_mutex_lock(&s_callback_mutx);
+    pthread_mutex_lock(&s_mailbox.mutex);
     s_exit = true;
-    // Wake up the s_main_result_trd 
+
+    pthread_cond_signal(&s_callback_cond);
+    pthread_mutex_unlock(&s_callback_mutx);
+
     pthread_cond_signal(&s_mailbox.cond);
     pthread_mutex_unlock(&s_mailbox.mutex);
 
-    pthread_mutex_unlock(&s_async_env_mutx);
+    pthread_join(s_main_thread, NULL);
+    pthread_join(s_callback_trd, NULL);
 
     // delete all synchronous functions that were initialzed
     s_s_funcs_release();
@@ -345,19 +473,25 @@ int async_sync () {
     
     if (s_exit == false) {
 
+        // complete process all outstanding requests       
         pthread_mutex_lock(&s_async_env_mutx);
 
-        while (s_outstanding_requests > 0) {
+        while (s_outstanding_requests > 0 || s_outstanding_callbacks > 0) {
 
             // wait until it is possible to create new thread
             #ifdef LOG
-            printf("[async_sync] s_outstanding_requests = %d\n", s_outstanding_requests);
+            printf("[async_sync] s_outstanding_requests = %d, s_outstanding_callbacks = %d\n", s_outstanding_requests, s_outstanding_callbacks);
             #endif
 
             pthread_cond_wait(&s_async_env_cond, &s_async_env_mutx);
         }
 
         pthread_mutex_unlock(&s_async_env_mutx);  // allow s_main_result_trd to resume use of s_sync()
+        
+        #ifdef LOG
+        printf("[async_sync] return to MAIN\n");
+        #endif
+
         return 0;
     }
     else {
@@ -381,7 +515,7 @@ async_s_func_t *async_sync_func_init (void (*s_func)(void *arg, void *res)) {
     }
 
     // init function lock
-    if (pthread_mutex_init(&(p_async_s_func->lock), 0) < 0) {
+    if (pthread_mutex_init(&(p_async_s_func->lock), NULL) < 0) {
         perror("[async_sync_func_init] Failed to allocate lock\n");
         exit(EXIT_FAILURE);
     }
