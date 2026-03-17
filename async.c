@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <semaphore.h>
 #include <stdbool.h>
+#include <stdarg.h>
 
 #include <async.h>
 
@@ -70,7 +71,6 @@ typedef struct internal_async_id {
     pthread_t                   *callback_threads;      // callback thread - option for threads array
     slot_pool_t                 *slots_pool;            // pool of slots into memory pool. 
     index_queue_t               *requests_queue;        // worker requests cyclic queue
-    index_queue_t               *results_queue;         // worker results cyclic queue
     index_queue_t               *callback_queue;        // callback cyclic queue
     internal_async_s_func_t     **sync_functions;       // array of pointers to synchronous functions
     int                         workers;                // number of execution workers threads
@@ -78,7 +78,6 @@ typedef struct internal_async_id {
     int                         slots;                  // number of slots per queue
     int                         pool_size;              // number of tasks_t elements in tasks pool
     int                         sync_funcion_count;     // current number of synchronous functions elements
-    pthread_t                   main_result_thread;     // main orchestrating thread
     pthread_mutex_t             global_mutex;           // environment global mutex 
     pthread_cond_t              global_cond;            // environment global cond
 } internal_async_id_t;
@@ -266,21 +265,6 @@ static void s_s_funcs_add (internal_async_s_func_t *p_s_func) {
     async_id->sync_funcion_count++;
 }
 
-/**
- * Release all saved s_func structures
- */
-static void s_s_funcs_release (internal_async_id_t *async_id) {
-    int i;
-
-    // first destroy all allocated mutexes
-    for (i = 0; i < async_id->sync_funcion_count; i++)
-        pthread_mutex_destroy(&(async_id->sync_functions[i]->lock));
-
-    free(async_id->sync_functions);    // s_s_funcs.funcs is either a valid poiuner or NULL
-    async_id->sync_funcion_count = 0;
-    async_id->sync_functions = NULL;   // to make sure next calling to s_s_funcs_release () will not fail on free(invalid pointer)
-}
-
 
 /**
  * Main worker thread
@@ -327,8 +311,16 @@ static void *s_worker(void* arg) {
         // call the task function
         task->func(task->func_arg, task->func_res);
 
-        // push task id to reult queue for further processing
-        s_queue_push(async_id->results_queue, id);
+        // check if callback is included
+        if (task->callback != NULL) {
+            // push task id to callnack queue for further processing
+            s_queue_push(async_id->callback_queue, id);
+        }
+        else {
+            // relese slot
+            if (s_return_slot(async_id->slots_pool, id) < 0)
+                fprintf(stderr,"[s_worker] Failed to return task_id to slots pool\n");
+        }
 
         // send dond signal to async_sync() if was issued
         pthread_cond_signal(&async_id->global_cond);
@@ -405,45 +397,6 @@ static bool s_is_pool_full (slot_pool_t *p) {
 }
 
 /**
- * This is the main result thread. It runs as long as the async envirinment is active and as long as there are outstanding
- * async requests active. Per thread working thread completion, it will add a callback workload for callback thread
- * and signal it about new warkload to process
- */
-static void *s_main_result_trd (void *arg) {
-    internal_async_id_t *async_id = (internal_async_id_t *)arg;
-    int empty;
-
-    #ifdef LOG
-    printf("[s_main_result_trd] started\n");
-    #endif
-
-    // drain result_queue
-    while (sem_wait(&async_id->results_queue->sem_full) == 0) {
-        task_t *task;
-        int id;
-
-        id = s_queue_get(async_id->results_queue);
-        task = &async_id->tasks_pool[id];
-
-        // check if callback is included
-        if (task->callback != NULL) {
-            // insert task_id to callback queue
-            #ifdef LOG
-            printf("[s_main_result_trd] insert result_id  %d to callback queue\n", id);
-            #endif
-            s_queue_push(async_id->callback_queue, id);
-        }
-        else {
-            // return slot back to slot pool
-            if (s_return_slot(async_id->slots_pool, id) < 0)
-                fprintf(stderr, "[s_main_result_trd] Failed to release task slot\n");
-        }
-    }
-
-    return NULL;
-}
-
-/**
  * Initiate all async environment threads
  */
 static int s_launch_threads (internal_async_id_t *async_id) {
@@ -468,12 +421,6 @@ static int s_launch_threads (internal_async_id_t *async_id) {
         }
     }
     wr = async_id->workers;
-    
-    // launch main results thread
-    if (pthread_create(&async_id->main_result_thread, NULL, s_main_result_trd, async_id) < 0) {
-        perror("[s_launch_threads] Failed to launch main thread");
-        goto failed2;
-    }
 
     return 0;
 
@@ -491,20 +438,81 @@ failed1:
 }
 
 /**
+ * Release all saved s_func structures
+ */
+static void s_s_funcs_release (internal_async_id_t *async_id) {
+    int i;
+
+    // first destroy all allocated mutexes
+    for (i = 0; i < async_id->sync_funcion_count; i++)
+        pthread_mutex_destroy(&(async_id->sync_functions[i]->lock));
+
+    free(async_id->sync_functions);    // s_s_funcs.funcs is either a valid poiuner or NULL
+    async_id->sync_funcion_count = 0;
+    async_id->sync_functions = NULL;   // to make sure next calling to s_s_funcs_release () will not fail on free(invalid pointer)
+}
+
+/**
+ * Relsease slots_pool
+ */
+static void s_release_slots_pool (slot_pool_t *p) {
+    free(p->stack);
+    sem_destroy(&p->sem_avialable);
+    pthread_mutex_destroy(&p->lock);
+    free(p);
+}
+
+/**
+ * Release queue
+ */
+static void s_release_queue (index_queue_t *q) {
+    sem_destroy(&q->sem_empty);
+    sem_destroy(&q->sem_full);
+    pthread_mutex_destroy(&q->lock);
+    free(q->buffer);
+}
+
+/**
+ * Release all allocated resources for this environment
+ */
+static void s_release_resources (internal_async_id_t *async_id) {
+    s_release_slots_pool(async_id->slots_pool);
+    s_release_queue(async_id->callback_queue);
+    s_release_queue(async_id->requests_queue);
+    s_s_funcs_release(async_id);
+
+    pthread_mutex_destroy(&async_id->global_mutex);
+    pthread_cond_destroy(&async_id->global_cond);
+
+    free(async_id->tasks_pool);
+    free(async_id->workers_threads);
+    free(async_id->callback_threads);
+
+    free(async_id);
+}
+
+/**
  * Initialize asynchronous environment.
  * If the initialization failed the function returns -1 otherwise 0
+ * The function requires at list one argument: workers. callback is an optional argument
  */
-async_id_t async_init (const int max_threads) {
+async_id_t internal_async_init (int workers, ...) {
     internal_async_id_t *i_a_id;
     int slots, callbacks;
     int pool_size;
+    va_list args;
+    va_start(args);
 
-    slots = max_threads * TREADS_TO_SLOTS_RATIO;
+    callbacks = va_arg(args, typeof(callbacks));
+    slots = workers * TREADS_TO_SLOTS_RATIO;
+    va_end(args);
+    
+    if (callbacks == -1)
+        // make sure we get at least one callback thread
+        callbacks = (workers >  WARKERS_TO_CALLBACK_RATIO)? workers / WARKERS_TO_CALLBACK_RATIO: 1;    
 
-    // make sure we get at least one callback thread
-    callbacks = (max_threads >  WARKERS_TO_CALLBACK_RATIO)? max_threads / WARKERS_TO_CALLBACK_RATIO: 1;
 
-    pool_size = (slots + 1) * 3; // allow one extra memory slot per queue
+    pool_size = (slots + 1) * 2; // allow one extra memory slot per queue
 
     if ((i_a_id = malloc(sizeof(internal_async_id_t))) == NULL) {
         perror("[async_init] Failed to allocate RAM for async_id structure");
@@ -512,7 +520,7 @@ async_id_t async_init (const int max_threads) {
     }
     i_a_id->pool_size = pool_size;
     i_a_id->slots = slots;
-    i_a_id->workers = max_threads;
+    i_a_id->workers = workers;
     i_a_id->callbacks = callbacks;
     i_a_id->sync_funcion_count = 0;
     i_a_id->sync_functions = NULL;
@@ -528,30 +536,27 @@ async_id_t async_init (const int max_threads) {
     if ((i_a_id->requests_queue = s_init_circ_queue(slots)) == NULL)
         goto failed3;
 
-    if ((i_a_id->results_queue = s_init_circ_queue(slots)) == NULL)
+    if ((i_a_id->callback_queue = s_init_circ_queue(slots)) == NULL)
         goto failed4;
 
-    if ((i_a_id->callback_queue = s_init_circ_queue(slots)) == NULL)
-        goto failed5;
-
-    if ((i_a_id->workers_threads = malloc(max_threads*sizeof(pthread_t))) == NULL) {
+    if ((i_a_id->workers_threads = malloc(workers*sizeof(pthread_t))) == NULL) {
         perror("[async_init] Failed to allocate RAM for workers threads");
-        goto failed6;
+        goto failed5;
     }
 
     if ((i_a_id->callback_threads = malloc(callbacks*sizeof(pthread_t))) == NULL) {
         perror("[async_init] Failed to allocate RAM for callback threads");
-        goto failed7;
+        goto failed6;
     }
 
     if (pthread_mutex_init(&i_a_id->global_mutex, NULL) < 0) {
         perror("[async_init] Failed to initialized global mutex");
-        goto failed8;
+        goto failed7;
     }
 
     if (pthread_cond_init(&i_a_id->global_cond, NULL) < 0) {
         perror("[async_init] Failed to initialized global condition");
-        goto failed9;        
+        goto failed8;        
     }
 
     if (s_launch_threads(i_a_id) < 0) {
@@ -562,15 +567,15 @@ async_id_t async_init (const int max_threads) {
     return (async_id_t)i_a_id;
 
 failed9:
-    pthread_mutex_destroy(&i_a_id->global_mutex);
+    pthread_cond_destroy(&i_a_id->global_cond);
 failed8:
-    free(i_a_id->callback_threads);
+    pthread_mutex_destroy(&i_a_id->global_mutex);
 failed7:
-    free(i_a_id->workers_threads);
+    free(i_a_id->callback_threads);
 failed6:
-    free(i_a_id->callback_queue);
+    free(i_a_id->workers_threads);
 failed5:
-    free(i_a_id->results_queue);
+    free(i_a_id->callback_queue);
 failed4:
     free(i_a_id->requests_queue);
 failed3:
@@ -615,7 +620,7 @@ int async_launch (void (*ex_func)(void *arg, void *res), void (*cb_func)(void *a
 /**
  * Exit async state
  */
-int async_terminate (async_id_t async_id) {
+async_id_t async_terminate (async_id_t async_id) {
     internal_async_id_t *a_id = (internal_async_id_t *)async_id;
     int i, id;
     task_t *task;
@@ -643,7 +648,7 @@ int async_terminate (async_id_t async_id) {
 
     // wait for all workers to exit
     for (i = 0; i < a_id->workers; i++)
-        if (pthread_join(a_id->workers_threads[i], NULL) < 0);
+        pthread_join(a_id->workers_threads[i], NULL);
 
     // push poison pill to all callbacks
     for (i = 0; i < a_id->callbacks; i++) {
@@ -655,24 +660,19 @@ int async_terminate (async_id_t async_id) {
 
     // whait for all callbacks to exit
     for (i = 0; i < a_id->callbacks; i++)
-        if (pthread_join(a_id->callback_threads[i], NULL) < 0);
+        pthread_join(a_id->callback_threads[i], NULL);
 
     #ifdef LOG
     printf("[async_terminate] signaling main_tread to exit\n");
     #endif
 
-
-    // cancel main thread 
-    pthread_cancel(a_id->main_result_thread);
-
-    // delete all synchronous functions that were initialzed
-    s_s_funcs_release(a_id);
+    s_release_resources (a_id);
 
     #ifdef LOG
     printf("[async_terminate] Completed\n");
     #endif
 
-    return 0;
+    return NULL;
 }
 
 /**

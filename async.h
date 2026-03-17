@@ -17,15 +17,18 @@ int async_launch (void (*ex_func)(void *arg, void *res), void (*cb_func)(void *a
     void *ex_arg, void *ex_res, void *cb_res, async_id_t async_id);
 
 /**
- * Initialize the asynchronous state in the program. max_thread will limit the number of outstanding execution
- * requests the environment will support
+ * Initialize the asynchronous state in the program. workers is the number of outstanding execution
+ * requests the environment will support.
+ * Number of callbacks is an optional argument. If not specified, the initialization function will set it
+ * to number of workers/2 with a minimum of 1.
  */
-async_id_t async_init (const int max_threads);
+async_id_t internal_async_init(int workers, ...);
+#define async_init(...) internal_async_init(__VA_ARGS__ __VA_OPT__(,) -1)
 
 /**
  * Terminate the asyhchronous state. The functioin returns after all outstanding requests are finished
  */
-int async_terminate (async_id_t async_id);
+async_id_t async_terminate (async_id_t async_id);
 
 /**
  * Call this function to block main program untill all outstanding requests complete. Unlike async_terminate()

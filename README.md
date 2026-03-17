@@ -2,17 +2,17 @@
 Enable asynchronous state inside a C program in which functions can be launched asynchronously.
 These files should be compiled as a static library.
 
-I chose the basic approach of creating new threads per launch request with a limit on how many outstanding
-threads I can run. Basically, except for the execution function, all other arguments for async_launch() are
-optional and can be replaced by NULL.
-
-In case there is a need to update a global variables or do any synchronous work by the called async function,
-it is possible to define a function that will be executed synchronously. This function must be short; otherwise, it
-will block the rest of the outstanding function calls that also need to use this synchronous function.
+I chose the workers/queues approach. There are execution workers and callback workers.
+Basically, except for the execution function and async_id variable, which was returned by the async_init() function, all other arguments for async_launch() are optional and can be replaced by NULL.
 
 In this implementation, the role of the callback function is to pass results from the called asynchronous function 
-back to the main program. The callback function is called within the main orchestrator thread, therefore it must be
-short and definitely not blocking by IO activity, otherwise the main orchestrating thread might block and consequently 
-the execution threads as well.
+back to the main program. In most cases it is a light function; therefore, as a default, the number of callback workers
+that are brought up by default is 1/2 of the number of execution workers. If the callback functions need more time
+and the environment needs more callback workers to work properly; it is possible to add the number required
+callback workers as the second argument to the async_init() function.
+
+Since both the calling function and callbacks run asynchronously, if the main program needs any of them to update
+a global variable, it is possible to use the async_call() function with internally used pthread_mutex_lock() before
+It calls the requested function and pthread_mutex_unlock() before it returns to the main program.
 
 Note, however, that the called function must be defined as specified even though it does not need any arguments.
